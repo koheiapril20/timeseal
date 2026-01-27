@@ -54,7 +54,33 @@ timeseal unlock bundle.tsl -o secret.txt
 
 The unlock process requires completing the full sequential computation.
 
-### 5. Inspect a bundle
+### 5. Pause and resume
+
+Both `seal` and `unlock` support pausing and resuming long-running operations.
+
+**Pause**: Press `Ctrl+C` during computation to save progress to a checkpoint file.
+
+```
+$ timeseal seal --difficulty=90000 -o bundle.tsl secret.txt
+Deriving wrapping key (difficulty=90000)...
+Press Ctrl+C to pause and save checkpoint.
+  Progress: 25.0% (22500/90000)
+^C
+Interrupt received, saving checkpoint...
+Checkpoint saved: bundle.tsl.seal.checkpoint
+Resume with: timeseal seal --resume bundle.tsl.seal.checkpoint
+```
+
+**Resume**: Use `--resume` to continue from a checkpoint.
+
+```bash
+timeseal seal --resume bundle.tsl.seal.checkpoint
+timeseal unlock --resume bundle.tsl.unlock.checkpoint
+```
+
+Checkpoint files are automatically removed upon successful completion.
+
+### 6. Inspect a bundle
 
 ```bash
 timeseal info bundle.tsl
@@ -71,6 +97,16 @@ Displays metadata without unlocking.
 | `seal` | Seal data with delay-based encryption |
 | `unlock` | Recover sealed data after computation |
 | `info` | Display bundle metadata |
+
+### Key Flags
+
+| Flag | Commands | Description |
+|------|----------|-------------|
+| `--difficulty` | `seal` | Number of sequential computation rounds |
+| `--target` | `calibrate` | Target duration (e.g., `1h`, `1d`, `7d`) |
+| `--resume` | `seal`, `unlock` | Resume from a checkpoint file |
+| `--output, -o` | `seal`, `unlock` | Output file path |
+| `--json` | `bench`, `calibrate` | Output in JSON format |
 
 ## Technical Details
 
