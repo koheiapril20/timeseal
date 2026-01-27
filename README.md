@@ -44,6 +44,8 @@ timeseal seal --difficulty=90000 secret.txt -o bundle.tsl
 
 For files larger than 64 KiB, an external payload file (`bundle.tsl.payload`) is created automatically.
 
+> **Note**: The seal operation requires the same computation time as unlock. See [Design Rationale](#design-rationale) for details.
+
 ### 4. Unlock data
 
 ```bash
@@ -76,6 +78,34 @@ Displays metadata without unlocking.
 - **Encryption**: ChaCha20-Poly1305 (AEAD)
 - **Integrity**: SHA-256 for external payloads
 - **Bundle format**: JSON with base64-encoded binary fields
+
+## Design Rationale
+
+### Why both seal and unlock take the same time
+
+Unlike RSA-based time-lock puzzles, chained Argon2id has no "trapdoor" that allows the sealer to skip computation. Both seal and unlock must complete the full sequential hash chain.
+
+```
+Target difficulty for 1 hour unlock:
+  - Seal time:   ~1 hour
+  - Unlock time: ~1 hour
+  - Total:       ~2 hours
+```
+
+### Why not use RSA time-lock?
+
+RSA time-lock puzzles allow instant sealing (if you know the prime factors), but they are vulnerable to hardware acceleration:
+
+| Property | Chained Argon2id | RSA Time-Lock |
+|----------|------------------|---------------|
+| Seal time | Same as unlock | Instant |
+| Memory-hard | Yes (256 MiB/round) | No |
+| ASIC/FPGA resistance | High | **Low** |
+| GPU resistance | High | **Low** |
+
+RSA time-lock relies purely on CPU-bound computation, allowing specialized hardware to achieve **10x–100x speedups**. Argon2id's memory-hardness ensures that memory bandwidth becomes the bottleneck, limiting the advantage of specialized hardware.
+
+This design prioritizes **fairness between general users and well-resourced attackers** over seal-time convenience.
 
 ## Disclaimer
 
