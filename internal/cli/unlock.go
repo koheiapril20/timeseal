@@ -2,12 +2,17 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/koheiapril20/timeseal/internal/bundle"
+	"github.com/koheiapril20/timeseal/internal/checkpoint"
 	"github.com/koheiapril20/timeseal/internal/crypto"
 	"github.com/koheiapril20/timeseal/internal/delaykdf"
 	"github.com/spf13/cobra"
@@ -16,22 +21,36 @@ import (
 var unlockCmd = &cobra.Command{
 	Use:   "unlock <bundle>",
 	Short: "Recover sealed data after completing computation",
-	Long:  `Derives the key through sequential computation and decrypts the data.`,
-	Args:  cobra.ExactArgs(1),
-	RunE:  runUnlock,
+	Long: `Derives the key through sequential computation and decrypts the data.
+
+Supports pause/resume: Press Ctrl+C to save progress to a checkpoint file.
+Use --resume to continue from a saved checkpoint.`,
+	Args: cobra.MaximumNArgs(1),
+	RunE: runUnlock,
 }
 
 var (
 	unlockPayload string
 	unlockOutput  string
+	unlockResume  string
 )
 
 func init() {
 	unlockCmd.Flags().StringVar(&unlockPayload, "payload", "", "Path to external payload file")
 	unlockCmd.Flags().StringVarP(&unlockOutput, "output", "o", "", "Output file (default: stdout)")
+	unlockCmd.Flags().StringVar(&unlockResume, "resume", "", "Resume from checkpoint file")
 }
 
 func runUnlock(cmd *cobra.Command, args []string) error {
+	// Resume mode
+	if unlockResume != "" {
+		return runUnlockResume()
+	}
+
+	if len(args) == 0 {
+		return fmt.Errorf("bundle path is required (or use --resume to continue from checkpoint)")
+	}
+
 	bundlePath := args[0]
 
 	// Read bundle
@@ -65,7 +84,6 @@ func runUnlock(cmd *cobra.Command, args []string) error {
 		}
 		fmt.Fprintf(os.Stderr, "Mode: inline\n")
 	} else {
-		// External payload
 		payloadPath := unlockPayload
 		if payloadPath == "" {
 			payloadPath = bundlePath + ".payload"
@@ -75,7 +93,6 @@ func runUnlock(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("failed to read payload: %w", err)
 		}
 
-		// Verify payload integrity
 		expectedHash, err := b.GetPayloadHash()
 		if err != nil {
 			return fmt.Errorf("failed to get payload hash: %w", err)
@@ -87,14 +104,10 @@ func runUnlock(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(os.Stderr, "Mode: external (payload verified)\n")
 	}
 
-	// Extract nonce from encrypted payload (first 12 bytes)
 	if len(encryptedPayload) < crypto.NonceSize {
 		return fmt.Errorf("invalid payload: too short")
 	}
-	payloadNonce := encryptedPayload[:crypto.NonceSize]
-	payloadCiphertext := encryptedPayload[crypto.NonceSize:]
 
-	// Derive wrapping key
 	seed, err := b.GetSeed()
 	if err != nil {
 		return fmt.Errorf("failed to get seed: %w", err)
@@ -107,17 +120,147 @@ func runUnlock(cmd *cobra.Command, args []string) error {
 		Rounds:      b.Challenge.Params.Rounds,
 	}
 
+	// Setup cancellation context
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		fmt.Fprintf(os.Stderr, "\n\nInterrupt received, saving checkpoint...\n")
+		cancel()
+	}()
+
 	fmt.Fprintf(os.Stderr, "Deriving key (this may take a while)...\n")
-	wrappingKey, err := delaykdf.DeriveWithProgress(seed, params, func(current, total uint32) {
+	fmt.Fprintf(os.Stderr, "Press Ctrl+C to pause and save checkpoint.\n")
+	state := delaykdf.NewState(seed, params)
+
+	wrappingKey, err := delaykdf.DeriveWithContext(ctx, state, func(current, total uint32) {
 		if total <= 100 || current%(total/100) == 0 || current == total {
 			pct := float64(current) / float64(total) * 100
 			fmt.Fprintf(os.Stderr, "\r  Progress: %.1f%% (%d/%d)", pct, current, total)
 		}
 	})
+
+	if errors.Is(err, delaykdf.ErrInterrupted) {
+		cpPath := bundlePath + ".unlock.checkpoint"
+		cp := checkpoint.UnlockCheckpoint(state, bundlePath, unlockOutput)
+		if err := cp.Save(cpPath); err != nil {
+			return fmt.Errorf("failed to save checkpoint: %w", err)
+		}
+		fmt.Fprintf(os.Stderr, "Checkpoint saved: %s\n", cpPath)
+		fmt.Fprintf(os.Stderr, "Resume with: timeseal unlock --resume %s\n", cpPath)
+		return nil
+	}
 	if err != nil {
 		return fmt.Errorf("delaykdf failed: %w", err)
 	}
 	fmt.Fprintln(os.Stderr)
+
+	return finalizeUnlock(b, wrappingKey, encryptedPayload, unlockOutput)
+}
+
+func runUnlockResume() error {
+	cp, err := checkpoint.Load(unlockResume)
+	if err != nil {
+		return fmt.Errorf("failed to load checkpoint: %w", err)
+	}
+	if cp.Type != checkpoint.TypeUnlock {
+		return fmt.Errorf("checkpoint is not for unlock operation")
+	}
+
+	fmt.Fprintf(os.Stderr, "Resuming unlock from checkpoint...\n")
+	fmt.Fprintf(os.Stderr, "Progress: %.1f%% (%d/%d)\n",
+		float64(cp.CurrentRound)/float64(cp.TotalRounds)*100,
+		cp.CurrentRound, cp.TotalRounds)
+
+	bundlePath := cp.BundlePath
+
+	// Read bundle
+	bundleData, err := os.ReadFile(bundlePath)
+	if err != nil {
+		return fmt.Errorf("failed to read bundle: %w", err)
+	}
+
+	b, err := bundle.ParseBytes(bundleData)
+	if err != nil {
+		return fmt.Errorf("failed to parse bundle: %w", err)
+	}
+
+	// Get encrypted payload
+	var encryptedPayload []byte
+	if b.IsInline() {
+		encryptedPayload, err = b.GetInlinePayload()
+		if err != nil {
+			return fmt.Errorf("failed to get inline payload: %w", err)
+		}
+	} else {
+		payloadPath := bundlePath + ".payload"
+		encryptedPayload, err = os.ReadFile(payloadPath)
+		if err != nil {
+			return fmt.Errorf("failed to read payload: %w", err)
+		}
+	}
+
+	state, err := cp.ToState()
+	if err != nil {
+		return fmt.Errorf("invalid checkpoint: %w", err)
+	}
+
+	// Setup cancellation context
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		fmt.Fprintf(os.Stderr, "\n\nInterrupt received, saving checkpoint...\n")
+		cancel()
+	}()
+
+	fmt.Fprintf(os.Stderr, "Press Ctrl+C to pause and save checkpoint.\n")
+	wrappingKey, err := delaykdf.DeriveWithContext(ctx, state, func(current, total uint32) {
+		if total <= 100 || current%(total/100) == 0 || current == total {
+			pct := float64(current) / float64(total) * 100
+			fmt.Fprintf(os.Stderr, "\r  Progress: %.1f%% (%d/%d)", pct, current, total)
+		}
+	})
+
+	if errors.Is(err, delaykdf.ErrInterrupted) {
+		cp2 := checkpoint.UnlockCheckpoint(state, bundlePath, cp.OutputFile)
+		if err := cp2.Save(unlockResume); err != nil {
+			return fmt.Errorf("failed to save checkpoint: %w", err)
+		}
+		fmt.Fprintf(os.Stderr, "Checkpoint updated: %s\n", unlockResume)
+		fmt.Fprintf(os.Stderr, "Resume with: timeseal unlock --resume %s\n", unlockResume)
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("delaykdf failed: %w", err)
+	}
+	fmt.Fprintln(os.Stderr)
+
+	output := cp.OutputFile
+	if unlockOutput != "" {
+		output = unlockOutput
+	}
+
+	if err := finalizeUnlock(b, wrappingKey, encryptedPayload, output); err != nil {
+		return err
+	}
+
+	// Cleanup checkpoint
+	os.Remove(unlockResume)
+	fmt.Fprintf(os.Stderr, "Checkpoint file removed.\n")
+
+	return nil
+}
+
+func finalizeUnlock(b *bundle.Bundle, wrappingKey, encryptedPayload []byte, outputPath string) error {
+	payloadNonce := encryptedPayload[:crypto.NonceSize]
+	payloadCiphertext := encryptedPayload[crypto.NonceSize:]
 
 	// Unwrap data key
 	wrapNonce, err := b.GetKeyWrapNonce()
@@ -142,8 +285,8 @@ func runUnlock(cmd *cobra.Command, args []string) error {
 
 	// Write output
 	var out io.Writer
-	if unlockOutput != "" {
-		f, err := os.Create(unlockOutput)
+	if outputPath != "" {
+		f, err := os.Create(outputPath)
 		if err != nil {
 			return fmt.Errorf("failed to create output: %w", err)
 		}
@@ -157,8 +300,8 @@ func runUnlock(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to write output: %w", err)
 	}
 
-	if unlockOutput != "" {
-		fmt.Fprintf(os.Stderr, "Output: %s (%d bytes)\n", unlockOutput, len(plaintext))
+	if outputPath != "" {
+		fmt.Fprintf(os.Stderr, "Output: %s (%d bytes)\n", outputPath, len(plaintext))
 	}
 	fmt.Fprintf(os.Stderr, "Unlocked successfully.\n")
 
