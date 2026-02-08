@@ -136,14 +136,11 @@ func runUnlock(cmd *cobra.Command, args []string) error {
 	fmt.Fprintf(os.Stderr, "Press Ctrl+C to pause and save checkpoint.\n")
 	state := delaykdf.NewState(seed, params)
 
-	wrappingKey, err := delaykdf.DeriveWithContext(ctx, state, func(current, total uint32) {
-		if total <= 100 || current%(total/100) == 0 || current == total {
-			pct := float64(current) / float64(total) * 100
-			fmt.Fprintf(os.Stderr, "\r  Progress: %.1f%% (%d/%d)", pct, current, total)
-		}
-	})
+	progress := NewProgressBar(params.Rounds, ModeUnlock)
+	wrappingKey, err := delaykdf.DeriveWithContext(ctx, state, progress.Callback())
 
 	if errors.Is(err, delaykdf.ErrInterrupted) {
+		fmt.Fprintln(os.Stderr)
 		cpPath := bundlePath + ".unlock.checkpoint"
 		cp := checkpoint.UnlockCheckpoint(state, bundlePath, unlockOutput)
 		if err := cp.Save(cpPath); err != nil {
@@ -156,7 +153,7 @@ func runUnlock(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("delaykdf failed: %w", err)
 	}
-	fmt.Fprintln(os.Stderr)
+	progress.Finish()
 
 	return finalizeUnlock(b, wrappingKey, encryptedPayload, unlockOutput)
 }
@@ -221,14 +218,12 @@ func runUnlockResume() error {
 	}()
 
 	fmt.Fprintf(os.Stderr, "Press Ctrl+C to pause and save checkpoint.\n")
-	wrappingKey, err := delaykdf.DeriveWithContext(ctx, state, func(current, total uint32) {
-		if total <= 100 || current%(total/100) == 0 || current == total {
-			pct := float64(current) / float64(total) * 100
-			fmt.Fprintf(os.Stderr, "\r  Progress: %.1f%% (%d/%d)", pct, current, total)
-		}
-	})
+	progress := NewProgressBar(state.Params.Rounds, ModeUnlock)
+	progress.Update(state.CurrentRound) // Show initial progress
+	wrappingKey, err := delaykdf.DeriveWithContext(ctx, state, progress.Callback())
 
 	if errors.Is(err, delaykdf.ErrInterrupted) {
+		fmt.Fprintln(os.Stderr)
 		cp2 := checkpoint.UnlockCheckpoint(state, bundlePath, cp.OutputFile)
 		if err := cp2.Save(unlockResume); err != nil {
 			return fmt.Errorf("failed to save checkpoint: %w", err)
@@ -240,7 +235,7 @@ func runUnlockResume() error {
 	if err != nil {
 		return fmt.Errorf("delaykdf failed: %w", err)
 	}
-	fmt.Fprintln(os.Stderr)
+	progress.Finish()
 
 	output := cp.OutputFile
 	if unlockOutput != "" {

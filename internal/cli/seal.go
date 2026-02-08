@@ -105,14 +105,11 @@ func runSeal(cmd *cobra.Command, args []string) error {
 	params := delaykdf.DefaultParams(sealDifficulty)
 	state := delaykdf.NewState(seed, params)
 
-	wrappingKey, err := delaykdf.DeriveWithContext(ctx, state, func(current, total uint32) {
-		if total <= 100 || current%(total/100) == 0 || current == total {
-			pct := float64(current) / float64(total) * 100
-			fmt.Fprintf(os.Stderr, "\r  Progress: %.1f%% (%d/%d)", pct, current, total)
-		}
-	})
+	progress := NewProgressBar(sealDifficulty, ModeSeal)
+	wrappingKey, err := delaykdf.DeriveWithContext(ctx, state, progress.Callback())
 
 	if errors.Is(err, delaykdf.ErrInterrupted) {
+		fmt.Fprintln(os.Stderr)
 		// Save checkpoint
 		cpPath := getCheckpointPath(sealOutput, inputName)
 		cp := checkpoint.SealCheckpoint(state, seed, dataKey, inputName, sealOutput)
@@ -140,7 +137,7 @@ func runSeal(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("delaykdf failed: %w", err)
 	}
-	fmt.Fprintln(os.Stderr)
+	progress.Finish()
 
 	return finalizeSeal(seed, dataKey, wrappingKey, data, params, sealOutput)
 }
@@ -187,14 +184,12 @@ func runSealResume() error {
 	}()
 
 	fmt.Fprintf(os.Stderr, "Press Ctrl+C to pause and save checkpoint.\n")
-	wrappingKey, err := delaykdf.DeriveWithContext(ctx, state, func(current, total uint32) {
-		if total <= 100 || current%(total/100) == 0 || current == total {
-			pct := float64(current) / float64(total) * 100
-			fmt.Fprintf(os.Stderr, "\r  Progress: %.1f%% (%d/%d)", pct, current, total)
-		}
-	})
+	progress := NewProgressBar(state.Params.Rounds, ModeSeal)
+	progress.Update(state.CurrentRound) // Show initial progress
+	wrappingKey, err := delaykdf.DeriveWithContext(ctx, state, progress.Callback())
 
 	if errors.Is(err, delaykdf.ErrInterrupted) {
+		fmt.Fprintln(os.Stderr)
 		// Update checkpoint
 		cp2 := checkpoint.SealCheckpoint(state, seed, dataKey, cp.InputFile, cp.OutputFile)
 		if err := cp2.Save(sealResume); err != nil {
@@ -207,7 +202,7 @@ func runSealResume() error {
 	if err != nil {
 		return fmt.Errorf("delaykdf failed: %w", err)
 	}
-	fmt.Fprintln(os.Stderr)
+	progress.Finish()
 
 	// Read encrypted data from temp file
 	tempDataPath := sealResume + ".data"
